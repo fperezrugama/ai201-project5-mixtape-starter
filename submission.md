@@ -1,3 +1,30 @@
+# AI Usage / Collaboration Statement
+
+This project was completed with the help of an AI coding assistant (Claude Code). I used it as a collaborator throughout while directing the overall process, reviewing its output, and making the final decisions. This is an honest account of how AI was and was not used — it did substantial analysis, coding, and drafting under my direction; I did not write every line myself, and I did not let it act unreviewed.
+
+**How I used AI**
+- **Understanding the codebase (Milestone 1):** I had it explore the repository, summarize each file, and explain the architecture, models, services, and routes. The codebase map in this document was produced with its help.
+- **Explaining unfamiliar code and tracing execution:** I asked it to walk through call chains (route → service → model) and explain how specific features work.
+- **Reproducing the bugs (Milestone 2):** I used it to run the test suite and write throwaway scripts against the seeded database, and to explain what the failing tests and outputs meant. It also helped me compare all five reported issues and decide which three were the most reliably reproducible.
+- **Locating root causes (Milestone 3):** It helped trace each bug to a specific line — for example, sweeping every weekday transition for the streak bug and doing a layer-by-layer trace for the playlist bug — and explained why each defect produced the observed behavior.
+- **Discussing and implementing fixes:** I discussed candidate fixes with it and had it apply the smallest change for each bug.
+- **Documentation:** It drafted the reproduction notes and root-cause write-ups in this file, which I reviewed for accuracy.
+- **Git history cleanup:** It helped me split a commit that accidentally contained two fixes into one commit per bug.
+
+![Git log showing separate fix commits](Screenshot 2026-07-05 at 12.52.13 AM.png)
+
+**How I verified the work rather than just trusting the AI**
+- I ran the full `pytest` suite and confirmed all 13 tests pass before accepting each fix.
+- I checked that each fix was scoped to a single bug and left unrelated behavior unchanged.
+- Before the rewritten Git history was force-pushed, I confirmed the resulting code was byte-for-byte identical to the original.
+
+**Where I corrected or questioned the AI**
+- I required an investigation-only pass that proved each root cause with evidence *before* any code was changed, and had a premature fix reverted so the process was followed in order.
+- A commit that had been labeled with the wrong message was identified and corrected.
+- I decided how the Git history should be restructured and explicitly approved the force-push rather than letting it happen automatically.
+
+---
+
 # Milestone 1 — Codebase Orientation
 
 _Mixtape: a Flask + SQLAlchemy social music-sharing app. This document is a mental model of the codebase only — no bugs are investigated or fixed here._
