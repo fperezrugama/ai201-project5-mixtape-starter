@@ -445,3 +445,107 @@ These three were selected because each reproduces **deterministically and indepe
 _Additional finding worth flagging (reproduction only, no diagnosis): Issues #2 and #3 could not be reproduced in this environment — #3 returns no duplicates through either the service or its tests, and #2's seed data always yields genuinely-recent feed entries. Recommend the three reproducible issues above._
 
 _Milestone 2 complete. Awaiting Milestone 3 instructions before inspecting any implementation or attempting any fixes._
+
+---
+---
+
+# Milestone 3A — Investigate, Fix, and Document Issue #5
+
+_Scope: Issue #5 only (the last song in a playlist never shows up). No other issues were investigated, and no unrelated code was changed._
+
+## 1. Investigation Log
+
+1. **Started from the Milestone 2 reproduction.** Confirmed the reported behavior: every seeded playlist has 7 entries in the database but `get_playlist_songs` returns only 6, and two unit tests (`test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`) fail. Condition: any playlist with ≥1 song. Reproducibility: always.
+2. **Traced the execution path** from the affected route (`GET /playlists/<id>/songs`) down to the service. Only one service function is involved: `playlist_service.get_playlist_songs`.
+3. **Read the implementation** of `get_playlist_songs`. The function (a) validates the playlist exists, (b) runs a SQL query joining `Song` to `playlist_entries`, filtered by playlist and ordered by `position`, then (c) returns `[song.to_dict() for song in songs[:-1]]`.
+4. **Isolated the query from the slice.** Replicated the exact query inline against the seeded "Late Night Vibes" playlist *without* the `[:-1]` slice. The query returned **all 7 songs** in correct position order (`Midnight Drive … Free Throws`). Applying `[:-1]` dropped exactly the last one (`Free Throws`). This proved the query is correct and the slice is the sole cause.
+5. **Applied the smallest fix** (removed the slice) and verified via the test suite and seed data, including boundary cases (empty playlist, single-song playlist).
+6. **Removed all temporary debug scripts** (they were standalone throwaway scripts run against the DB; no debug code was ever added to source files).
+
+## 2. Execution Trace
+
+`GET /playlists/<playlist_id>/songs`
+
+| Step | Function / location | Responsibility | Inputs | Outputs | Relevant? |
+|------|---------------------|----------------|--------|---------|-----------|
+| Route | `routes/playlists.py` → `get_songs(playlist_id)` (lines 34–40) | Receive the HTTP request, call the service, wrap the result as `{"songs": ..., "count": len(...)}`, map `ValueError` → 404 | `playlist_id` from URL | JSON response | Relevant as entry point; contains no bug — it faithfully returns whatever the service gives it (so an off-by-one in the service flows straight through to `count`). |
+| Service | `services/playlist_service.py` → `get_playlist_songs(playlist_id)` (lines 38–66) | Validate the playlist exists, fetch its songs ordered by position, serialize to dicts | `playlist_id: str` | `list[dict]` of songs | **Relevant — contains the bug.** |
+| — validation | line 53–55: `db.session.get(Playlist, playlist_id)` | Raise `ValueError` if the playlist doesn't exist | `playlist_id` | `Playlist` or raises | Not the cause; behaves correctly. |
+| — query | lines 58–64: `query(Song).join(playlist_entries…).filter(playlist_id).order_by(position).all()` | Retrieve all songs in the playlist, ordered ascending by `position` | `playlist_id` | full ordered `list[Song]` (verified: 7 rows for a 7-entry playlist) | Not the cause; **verified correct** — returns every entry in order. |
+| — return | line 66: `return [song.to_dict() for song in songs[:-1]]` | Serialize the songs to dicts | full `list[Song]` | dicts for all songs **except the last** | **Root cause.** |
+| Helpers | `Song.to_dict()` (`models.py` 92–103) | Serialize a Song to a dict | `Song` | `dict` | Not the cause; serialization is fine. |
+| Models / DB | `Song`, `playlist_entries` (`models.py`) | Storage + schema | — | rows | Not the cause; data is intact (DB has all 7 entries). |
+
+## 3. Root Cause Analysis
+
+### Issue Number and Title
+**Issue #5 — The last song in a playlist never shows up.**
+
+### How I Reproduced It
+- Seeded the DB (`python seed_data.py`) and ran `pytest tests/test_playlists.py` — `test_playlist_returns_all_songs` (expected 5, got 4) and `test_playlist_returns_songs_in_order` (expected `[Track 1..Track 5]`, got `[Track 1..Track 4]`) both failed.
+- Independently, calling `get_playlist_songs` for each seeded playlist returned 6 songs while the DB held 7 `playlist_entries` rows — the song at the highest `position` was always missing.
+
+### How I Found the Root Cause
+Tracing from the route, the only logic in the path is `get_playlist_songs`. I split that function into its two parts — the query and the return expression — and ran the query in isolation against the "Late Night Vibes" playlist. It returned all 7 songs in correct order, confirming the database and the query are correct. Manually applying the function's `songs[:-1]` slice to that result reproduced the exact 6-song output, pinpointing the slice as the sole cause.
+
+### The Root Cause
+**File:** `services/playlist_service.py` · **Function:** `get_playlist_songs` · **Line 66.**
+
+The return statement was:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+The query builds `songs` as the complete, position-ordered list of every song in the playlist. The Python slice `songs[:-1]` means "every element except the last one." So the function deliberately discards the final list element — the song at the highest `position` — before serializing.
+
+- **What the code assumed:** nothing about the data required dropping an element; the function's own docstring states *"This function returns all songs in the playlist."*
+- **What actually happens:** `[:-1]` removes the last item, so the function returns `n − 1` songs for an `n`-song playlist.
+- **Why they differ:** the slice contradicts the intended (and documented) behavior — it is an off-by-one truncation applied to an otherwise-correct result set.
+- **Why it produces the observed behavior:** because the query orders by `position` ascending, the dropped element is always the last/highest-position song — exactly matching the user report that "the last song never shows up." For a single-song playlist the effect is even more severe: `[:-1]` yields an empty list, hiding the only song.
+
+### My Fix
+Remove the slice so the comprehension iterates the full result set:
+
+```python
+# before
+return [song.to_dict() for song in songs[:-1]]
+# after
+return [song.to_dict() for song in songs]
+```
+
+**Why this line is necessary and sufficient:** the query already returns the correct, fully-ordered set of songs, so the only defect is the truncation. Removing `[:-1]` makes the function return all songs, matching its docstring. No other line needs to change; the validation, query, ordering, and serialization were all already correct. Empty playlists remain safe (iterating an empty list yields `[]`, with no `IndexError`).
+
+### Side-Effect Checks
+- **Original reproduction (tests):** `pytest tests/test_playlists.py` — all 3 pass (previously 2 failed).
+- **Full suite:** `pytest tests/` — 12 passed, 1 failed. The lone failure is `test_streak_increments_on_sunday` (Issue #1, untouched). Before the fix the suite had 3 failures (2 playlist + 1 streak); now only the unrelated streak failure remains, confirming the change is correctly scoped.
+- **All seeded playlists:** each now returns all 7 entries including the last (`Free Throws`, `Harlem Renaissance`, `Lagos to London`).
+- **Boundary — empty playlist:** returns `[]` with no error.
+- **Boundary — single-song playlist:** now returns the 1 song (previously the slice would have returned `[]` — this was the most severe manifestation of the bug).
+- **Neighboring functions in the same module:** `get_playlist` (metadata), `get_user_playlists`, and `create_playlist` all behave correctly and were not modified.
+- **Ordering preserved:** returned songs remain in ascending `position` order (`test_playlist_returns_songs_in_order` passes).
+
+## 4. Summary of Code Changes
+
+| File | Change | Lines |
+|------|--------|-------|
+| `services/playlist_service.py` | In `get_playlist_songs`, changed `songs[:-1]` → `songs` in the return comprehension, so all songs are returned instead of all-but-last. | 1 line (line 66) |
+
+No other files were modified. `submission.md` was updated with this documentation (deliverable, not source).
+
+## 5. Side-Effect Testing Results
+
+_See "Side-Effect Checks" above — summarized: 3/3 playlist tests pass; full suite 12 passed / 1 failed (only the unrelated Issue #1 streak test); all seeded playlists return complete lists; empty- and single-song boundaries behave correctly; neighboring playlist functions unaffected; ordering preserved._
+
+## 6. Suggested Commit Message
+
+_(Recommended only — not committed, per instructions.)_
+
+```bash
+git add services/playlist_service.py
+git commit -m "fix: return all songs from get_playlist_songs instead of dropping the last"
+```
+
+---
+
+_Milestone 3A complete for Issue #5. No other issues were investigated. Awaiting Milestone 3B instructions._
