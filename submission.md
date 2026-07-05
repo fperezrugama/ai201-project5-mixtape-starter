@@ -549,3 +549,110 @@ git commit -m "fix: return all songs from get_playlist_songs instead of dropping
 ---
 
 _Milestone 3A complete for Issue #5. No other issues were investigated. Awaiting Milestone 3B instructions._
+
+
+---
+---
+
+# Milestone 3C — Investigate, Fix, and Document Issue #4
+
+_Scope: Issue #4 only (a notification is created when a friend adds your song to a playlist, but not when they rate it). No other issues were investigated, and no unrelated code was changed._
+
+## 1. Investigation Log
+
+1. **Reviewed the Milestone 2 reproduction.** Confirmed: expected behavior is that rating another user's song notifies the song's sharer (mirroring the playlist-add notification); actual behavior is that no notification is created; required state is a song shared by one user and a *different* user submitting a rating.
+2. **Traced the execution path** from the endpoint used in reproduction (`POST /songs/<song_id>/rate`) into `notification_service.rate_song`.
+3. **Read `rate_song` and compared it against the working `add_to_playlist`.** `add_to_playlist` (lines 64–70) ends by calling `create_notification(...)` for `song.shared_by` when the actor isn't the sharer. `rate_song` (lines 73–110) validates the score, upserts the `Rating`, commits, and returns — **with no call to `create_notification` anywhere**.
+4. **Noted corroborating evidence in the code itself.** `create_notification`'s docstring lists `'song_rated'` as an example `notification_type` (line 19), indicating a rating notification was intended but never wired up.
+5. **Reproduced with instrumentation.** Rating "Crown Heights Anthem" (shared by `simone`) as `nova`: the `Rating` count went 0→1 and `rate_song` returned a valid `Rating`, while `simone`'s notification count stayed 0→0 — proving the rating path works and only the notification is missing.
+6. **Used only throwaway scripts** against the seeded DB; no debug code was added to source, so none needed removal.
+
+## 2. Execution Trace
+
+`POST /songs/<song_id>/rate`
+
+| Step | Function / location | Responsibility | Inputs | Outputs | Relevant? |
+|------|---------------------|----------------|--------|---------|-----------|
+| Route | `routes/songs.py` → `rate(song_id)` (lines 29–40) | Parse JSON, require `user_id` and `score`, call the service, return `rating.to_dict()` (201); map `ValueError`→400 | `song_id`, `user_id`, `score` | JSON `Rating` | Entry point; no bug. |
+| Service | `notification_service.rate_song(user_id, song_id, score)` (lines 73–110) | Validate score range, look up song & rater, upsert the `Rating`, commit | `user_id`, `song_id`, `score` | `Rating` | **Relevant — the notification step is missing here.** |
+| — validation | line 85–86 | reject score outside 1–5 | `score` | raises `ValueError` | Correct; not the cause. |
+| — lookups | line 88–94 | fetch `Song` and rater `User`, 404-style `ValueError` if missing | ids | `Song`, `User` | Correct; also make `song`/`rater` available for a notification. |
+| — upsert | line 96–108 | update existing rating or create a new one, then commit | — | `Rating` | Correct; the rating is persisted. |
+| — **return** | line 110: `return rating` | return the rating | — | `Rating` | **Root cause: the function returns without ever creating a notification.** |
+| Helper (not called) | `create_notification(user_id, type, body)` (lines 13–32) | persist a `Notification` for a user | — | `Notification` | Exists and works (used by `add_to_playlist`) — but `rate_song` never calls it. |
+| Reference (working) | `add_to_playlist` (lines 64–70) | notifies `song.shared_by` when actor ≠ sharer | — | — | The correct pattern that `rate_song` should mirror. |
+| Models / DB | `Rating`, `Notification` (`models.py`) | storage | — | rows | Not the cause. |
+
+## 3. Root Cause Analysis
+
+### Issue Number and Title
+**Issue #4 — I got notified when a friend added my song to a playlist, but not when they rated it.**
+
+### How I Reproduced It
+Seeded the DB and, as `nova`, rated `simone`'s song "Crown Heights Anthem". The rating was created (rating count 0→1, a valid `Rating` returned), but `simone`'s notification count stayed at 0 — no notification was generated.
+
+### How I Found the Root Cause
+Tracing from `POST /songs/<song_id>/rate`, the only service is `rate_song`. Reading it end to end shows it validates, upserts the rating, commits, and returns — with no notification logic. Comparing with the sibling `add_to_playlist`, which ends by calling `create_notification` for the song's sharer, made the omission explicit: the two "someone interacted with your song" paths were implemented inconsistently. The reproduction confirmed the divergence (rating persists; notification absent).
+
+### The Root Cause
+**File:** `services/notification_service.py` · **Function:** `rate_song` · **missing logic before line 110 (`return rating`).**
+
+`rate_song` never calls `create_notification`. The mechanism for notifying users exists (`create_notification`) and is used by `add_to_playlist`, but the rating path was never wired to it.
+
+- **What the code should do:** like `add_to_playlist`, notify the song's original sharer when someone *else* interacts with their song (here, rates it). The `create_notification` docstring even anticipates a `'song_rated'` type.
+- **What actually happens:** `rate_song` saves the rating and returns; no `Notification` row is ever created.
+- **Why they differ:** the notification call is simply absent from `rate_song` — an omission, not a wrong condition.
+- **Why it produces the observed behavior:** with no `create_notification` call, the sharer's notification list is unchanged after a rating, exactly matching the report ("notified on playlist-add but not on rating").
+
+### My Fix
+Add the same notify-the-sharer step used by `add_to_playlist`, after the rating is committed:
+
+```python
+    db.session.commit()
+
+    # Notify the person who originally shared the song (if it wasn't them who rated it)
+    if song.shared_by != user_id:
+        create_notification(
+            user_id=song.shared_by,
+            notification_type="song_rated",
+            body=f"{rater.username} rated your song '{song.title}' {score}/5.",
+        )
+
+    return rating
+```
+
+**Why each line is necessary:** the `if song.shared_by != user_id` guard mirrors `add_to_playlist` so a user isn't notified for rating their own song; `create_notification(...)` is the existing, tested mechanism for persisting a notification; `notification_type="song_rated"` matches the type documented in `create_notification`; the `body` follows the human-readable style of the playlist-add message. It is placed *after* `db.session.commit()` so the notification is only created once the rating has successfully persisted, and *before* `return rating` so the return value is unchanged. `song` and `rater` are already loaded earlier in the function, so no extra queries are needed. No existing line is modified.
+
+### Side-Effect Checks
+- **Original reproduction:** rating another user's song now creates exactly one notification for the sharer — type `song_rated`, body `"nova rated your song 'Crown Heights Anthem' 5/5."` (count 0→1).
+- **Full suite:** `pytest tests/` — **13 passed, 0 failed** (Issues #5 and #1 remain green; no regressions).
+- **Rating still persists correctly:** the `Rating` row is created with the correct score.
+- **Duplicate rating:** re-rating by the same user still updates the existing `Rating` in place (one row, score changed) — consistent with prior behavior. It also produces another `song_rated` notification, which is consistent with `add_to_playlist` (both notify on each qualifying call rather than deduplicating).
+- **Self-rating:** a user rating their **own** song creates **no** notification (guard works; delta 0).
+- **Playlist-add notifications still work:** unchanged — adding a song to a playlist still notifies the sharer (delta 1).
+- **Invalid score:** `score=9` still raises `ValueError` before any notification is created (delta 0), so validation is unaffected.
+
+## 4. Code Change Summary
+
+| File | Change | Purpose |
+|------|--------|---------|
+| `services/notification_service.py` | In `rate_song`, added a `create_notification(...)` call (guarded by `song.shared_by != user_id`) after the commit, before the return. | Notify the song's original sharer when a *different* user rates their song, matching the existing playlist-add behavior. |
+
+No other files were modified. `submission.md` updated with this documentation (deliverable, not source).
+
+## 5. Side-Effect Testing Results
+
+_See "Side-Effect Checks" above — summarized: full suite 13 passed / 0 failed; rating persists and upserts correctly; self-rating does not notify; playlist-add notifications still work; invalid scores still rejected with no notification; the new `song_rated` notification is created for the sharer with the correct type and body._
+
+## 6. Suggested Commit Message
+
+_(Recommended only — not committed, per instructions.)_
+
+```bash
+git add services/notification_service.py
+git commit -m "fix: notify song owner when another user rates their song"
+```
+
+---
+
+_Milestone 3C complete for Issue #4. Three issues (#5, #1, #4) have now been investigated, fixed, verified, and documented._
