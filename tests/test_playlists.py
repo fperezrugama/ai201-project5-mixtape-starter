@@ -84,3 +84,42 @@ def test_empty_playlist_returns_empty_list(app):
 
         songs = get_playlist_songs(playlist.id)
         assert songs == []
+
+
+def test_playlist_with_single_song_returns_that_song(app):
+    """
+    Regression (Issue #5): a playlist with exactly one song must return that
+    one song, never an empty list.
+
+    The original bug returned ``songs[:-1]``, dropping the last element. For a
+    one-song playlist that silently discarded the only song (returning ``[]``).
+    This is the smallest case that exposes the off-by-one — and unlike the
+    empty-playlist case, the buggy slice produces a *wrong* result here — so
+    the last song disappearing must never regress.
+    """
+    with app.app_context():
+        user = User(username="solodj", email="solodj@example.com")
+        db.session.add(user)
+        db.session.flush()
+
+        song = Song(title="Only Track", artist="Various", shared_by=user.id)
+        db.session.add(song)
+        db.session.flush()
+
+        playlist = Playlist(name="Single Song Playlist", created_by=user.id)
+        db.session.add(playlist)
+        db.session.flush()
+
+        db.session.execute(
+            playlist_entries.insert().values(
+                playlist_id=playlist.id,
+                song_id=song.id,
+                position=1,
+                added_by=user.id,
+            )
+        )
+        db.session.commit()
+
+        songs = get_playlist_songs(playlist.id)
+        titles = [s["title"] for s in songs]
+        assert titles == ["Only Track"]  # buggy songs[:-1] would return []
